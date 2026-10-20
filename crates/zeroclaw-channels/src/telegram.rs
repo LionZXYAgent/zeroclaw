@@ -1116,6 +1116,22 @@ fn prepare_rich_markdown(text: &str) -> String {
     wrap_markdown_tables(&neutralized, TELEGRAM_RICH_MAX_TABLE_COLUMNS)
 }
 
+/// Native rich blocks need `sendRichMessage`. Inline formatting and code use
+/// ordinary messages. Parse Markdown so escaped markers and code stay plain.
+/// Call this after `prepare_rich_markdown` so oversized tables stay ordinary.
+fn contains_native_rich_elements(markdown: &str) -> bool {
+    use pulldown_cmark::{Event, Options, Parser, Tag};
+
+    Parser::new_ext(markdown, Options::ENABLE_TABLES).any(|event| {
+        matches!(
+            event,
+            Event::Start(
+                Tag::Heading { .. } | Tag::List(_) | Tag::BlockQuote(_) | Tag::Table(_)
+            )
+        )
+    })
+}
+
 fn project_rich_message(value: &serde_json::Value) -> Option<String> {
     let blocks = value.get("blocks")?.as_array()?;
     let text = project_blocks(blocks);
@@ -1807,7 +1823,7 @@ pub struct TelegramChannel {
     /// Per-draft MultiMessage streaming state keyed by `(recipient, draft_id)`.
     multi_message_drafts: Mutex<std::collections::HashMap<MultiDraftKey, MultiDraftState>>,
     mention_only: bool,
-    /// When true, final replies use Bot API `sendRichMessage`.
+    /// When true, native rich blocks can use Bot API `sendRichMessage`.
     rich_messages: bool,
     /// When `false`, group-chat sessions are shared per chat/topic instead of
     /// per sender. See `with_per_user_session`.
@@ -3504,7 +3520,7 @@ impl TelegramChannel {
         self
     }
 
-    /// Send final replies with Bot API rich messages when `enabled`.
+    /// Use Bot API rich messages for native rich blocks when `enabled`.
     ///
     /// Headings, lists, quotes, and tables then render natively. Some clients
     /// still show those messages as unsupported, so callers leave this off
@@ -3517,7 +3533,7 @@ impl TelegramChannel {
         self
     }
 
-    /// Whether final replies use `sendRichMessage`.
+    /// Whether native rich blocks can use `sendRichMessage`.
     ///
     /// A long-lived channel reads `channels.telegram.<alias>.rich_messages`
     /// from the live config. The constructor snapshot is used only when no
@@ -3532,6 +3548,12 @@ impl TelegramChannel {
             .telegram
             .get(&self.alias)
             .is_some_and(|telegram| telegram.rich_messages)
+    }
+
+    /// Ordinary text and inline formatting do not need native rich messages.
+    fn use_rich_messages_for(&self, message: &str) -> bool {
+        self.rich_messages_enabled()
+            && contains_native_rich_elements(&prepare_rich_markdown(message))
     }
 
     /// Set by the orchestrator from `[channels.telegram.<alias>].per_user_session`.
@@ -6900,7 +6922,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         thread_id: Option<&str>,
         skip_chunks: usize,
     ) -> Result<usize, SendChunksError> {
-        if self.rich_messages_enabled() {
+        if self.use_rich_messages_for(message) {
             return self
                 .send_rich_text_chunks(message, chat_id, thread_id, skip_chunks, 0)
                 .await;
@@ -7028,7 +7050,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
         skip_chunks: usize,
         html_fallback_skip: usize,
     ) -> Result<usize, SendChunksError> {
-        if self.rich_messages_enabled() {
+        if self.use_rich_messages_for(message) {
             return self
                 .send_rich_text_chunks(message, chat_id, thread_id, skip_chunks, html_fallback_skip)
                 .await;
@@ -7062,7 +7084,7 @@ Allowlist Telegram username (without '@') or numeric user ID.",
                 chunk.to_string()
             };
             let resume_html = index == skip_chunks && html_fallback_skip > 0;
-            if !resume_html {
+            if !resume_html && contains_native_rich_elements(&text) {
                 match self
                     .send_rich_message_honoring_rate_limit(chat_id, thread_id, &text)
                     .await
@@ -9027,7 +9049,7 @@ impl Channel for TelegramChannel {
             return Ok(());
         }
 
-        if self.rich_messages_enabled()
+        if self.use_rich_messages_for(text)
             && let Some(id) = msg_id
         {
             let prepared = prepare_rich_markdown(text);
@@ -11574,7 +11596,7 @@ mod tests {
         use wiremock::matchers::{method, path_regex};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let message = "y".repeat(5_000);
+        let message = format!("# Status\n\n{}", "y".repeat(5_000));
         let html_chunks = split_message_for_telegram(&message);
         assert!(html_chunks.len() >= 2);
 
@@ -13763,6 +13785,237 @@ mod tests {
         )
         .with_rich_messages(true);
         assert!(snapshot.rich_messages_enabled());
+    }
+
+    #[test]
+    fn native_rich_routing_detects_structural_blocks() {
+        for markdown in [
+            "# Status\n\nReady.",
+            "Status\n======\n",
+            "- First\n- Second",
+            "1. First\n2. Second",
+            "- [ ] Open\n- [x] Done",
+            "> A quote",
+            "> - A nested list",
+            "| Name | Value |\n| --- | --- |\n| A | B |",
+        ] {
+            assert!(contains_native_rich_elements(&prepare_rich_markdown(markdown)), "{markdown:?}");
+        }
+    }
+
+    #[test]
+    fn native_rich_routing_keeps_plain_and_inline_content_ordinary() {
+        for markdown in [
+            "",
+            "Fixed. Plain messages use normal delivery.",
+            "First paragraph.\n\nSecond paragraph.",
+            "Готово. Обычное сообщение. 🙂",
+            "**Bold**, *italic*, ~~strike~~, and `code`.",
+            "[A link](https://example.com) and https://example.com",
+            "#not-a-heading\n1.2 is a number.\n2 * 3 = 6.",
+            "\\# Escaped heading\n\\- Escaped list\n\\> Escaped quote",
+            "`# heading` and `- list` and `> quote`",
+            "```markdown\n# Heading\n- List\n> Quote\n| A | B |\n| --- | --- |\n```",
+            "~~~markdown\n# Heading\n- List\n~~~",
+            "```markdown\n# An unclosed code block\n- Not a list",
+            "    # An indented code block\n    - Not a list",
+            "![Image](https://example.com/image.png) and $x^2$",
+        ] {
+            assert!(!contains_native_rich_elements(&prepare_rich_markdown(markdown)), "{markdown:?}");
+        }
+        let header = (0..21).map(|i| format!("c{i}")).collect::<Vec<_>>().join(" | ");
+        let separator = vec!["---"; 21].join(" | ");
+        let wide_table = format!("| {header} |\n| {separator} |\n");
+        assert!(!contains_native_rich_elements(&prepare_rich_markdown(&wide_table)));
+    }
+
+    #[test]
+    fn native_rich_routing_respects_the_configuration_flag() {
+        let channel = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        );
+        assert!(!channel.use_rich_messages_for("# Heading"));
+        let channel = channel.with_rich_messages(true);
+        assert!(!channel.use_rich_messages_for("Plain text with **bold**."));
+        assert!(channel.use_rich_messages_for("# Heading"));
+    }
+
+    #[tokio::test]
+    async fn native_rich_routing_sends_plain_and_inline_text_as_normal_messages() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "result": { "message_id": 1 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let channel = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_rich_messages(true)
+        .with_api_base(server.uri());
+        channel.send_text_chunks("Fixed. **Bold** and `code` stay ordinary.", "100", Some("64"), 0).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(requests[0].url.path().ends_with("/sendMessage"));
+        let body: serde_json::Value = requests[0].body_json().unwrap();
+        assert_eq!(body["chat_id"], "100");
+        assert_eq!(body["message_thread_id"], "64");
+        assert_eq!(body["parse_mode"], "HTML");
+        assert!(body["text"].as_str().unwrap().contains("<b>Bold</b>"));
+        assert!(body.get("rich_message").is_none());
+    }
+
+    #[tokio::test]
+    async fn native_rich_routing_keeps_structural_blocks_rich() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendRichMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "result": { "message_id": 1 }
+            })))
+            .expect(4)
+            .mount(&server)
+            .await;
+        let channel = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_rich_messages(true)
+        .with_api_base(server.uri());
+        for text in ["# Heading", "- Item", "> Quote", "| A | B |\n| --- | --- |\n| 1 | 2 |"] {
+            channel.send_text_chunks(text, "100", Some("64"), 0).await.unwrap();
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 4);
+        for request in requests {
+            assert!(request.url.path().ends_with("/sendRichMessage"));
+            let body: serde_json::Value = request.body_json().unwrap();
+            assert_eq!(body["message_thread_id"], "64");
+            assert!(contains_native_rich_elements(body["rich_message"]["markdown"].as_str().unwrap()));
+        }
+    }
+
+    #[tokio::test]
+    async fn native_rich_routing_long_plain_replies_and_resumes_stay_ordinary() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/sendMessage$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "result": { "message_id": 1 }
+            })))
+            .mount(&server)
+            .await;
+        let channel = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_rich_messages(true)
+        .with_api_base(server.uri());
+        let message = "я".repeat(5_000);
+        let count = split_message_for_telegram_keeping_tables(&message).len();
+        assert!(count > 1);
+        assert_eq!(channel.send_text_chunks(&message, "100", None, 0).await.unwrap(), count);
+        let sent = server.received_requests().await.unwrap().len();
+        assert_eq!(sent, count);
+        assert_eq!(channel.send_text_chunks_resuming(&message, "100", None, 1, 0).await.unwrap(), count);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len() - sent, count - 1);
+        for request in requests {
+            assert!(request.url.path().ends_with("/sendMessage"));
+            let body: serde_json::Value = request.body_json().unwrap();
+            assert!(body["text"].as_str().unwrap().chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH);
+        }
+    }
+
+    #[tokio::test]
+    async fn native_rich_routing_plain_chunks_of_a_mixed_reply_stay_ordinary() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/(sendMessage|sendRichMessage)$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "result": { "message_id": 1 }
+            })))
+            .mount(&server)
+            .await;
+        let channel = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_rich_messages(true)
+        .with_api_base(server.uri());
+        let message = format!("{}\n\n# Status\nReady.", "x".repeat(TELEGRAM_RICH_MAX_MESSAGE_LENGTH));
+        channel.send_text_chunks(&message, "100", None, 0).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests.iter().any(|request| request.url.path().ends_with("/sendMessage")));
+        assert!(requests.iter().any(|request| request.url.path().ends_with("/sendRichMessage")));
+        for request in requests {
+            let body: serde_json::Value = request.body_json().unwrap();
+            if request.url.path().ends_with("/sendRichMessage") {
+                assert!(contains_native_rich_elements(body["rich_message"]["markdown"].as_str().unwrap()));
+            } else {
+                assert!(body["text"].as_str().unwrap().chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn native_rich_routing_final_draft_edits_select_the_message_type() {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path_regex(r"/bot[^/]+/editMessageText$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "result": { "message_id": 42 }
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let channel = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            false,
+        )
+        .with_rich_messages(true)
+        .with_api_base(server.uri());
+        channel.finalize_draft("100:64", "42", "Plain text with **bold**.", true).await.unwrap();
+        channel.finalize_draft("100:64", "42", "# Status\nReady.", true).await.unwrap();
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let plain: serde_json::Value = requests[0].body_json().unwrap();
+        assert_eq!(plain["parse_mode"], "HTML");
+        assert!(plain.get("rich_message").is_none());
+        let rich: serde_json::Value = requests[1].body_json().unwrap();
+        assert_eq!(rich["rich_message"]["markdown"], "# Status\nReady.");
     }
 
     #[test]

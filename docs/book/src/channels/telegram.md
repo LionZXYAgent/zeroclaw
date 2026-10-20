@@ -90,10 +90,12 @@ so a grid stays together instead of being split mid-row or read as inline HTML.
 A table longer than one Telegram message continues on the next message with
 its header repeated.
 
-Set `rich_messages = true` on the channel alias to send final replies with Bot
-API `sendRichMessage`. Headings, lists, quotes, and tables then render
-natively. Some clients still show those messages as unsupported, so leave the
-flag off unless every client in use can render them.
+Set `rich_messages = true` on the channel alias to enable Bot API `sendRichMessage` for native rich blocks.
+Headings, lists, quotes, and tables then render natively.
+Plain text, inline formatting, and code use ordinary messages, even when this flag is enabled.
+The channel selects the message type for each chunk and for the final draft edit.
+Some clients show rich messages as unsupported.
+If any client in use cannot render them, leave the flag off.
 
 ```toml
 [channels.telegram.home]

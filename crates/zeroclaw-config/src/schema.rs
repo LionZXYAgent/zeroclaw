@@ -16839,7 +16839,8 @@ pub struct TelegramConfig {
     #[tab(Behavior)]
     #[serde(default)]
     pub mention_only: bool,
-    /// Send replies with Bot API rich messages (native tables, headings, lists, and quotes).
+    /// Use Bot API rich messages only for native tables, headings, lists, and quotes.
+    /// Plain text, inline formatting, and code use ordinary messages.
     ///
     /// Some Telegram clients still show rich messages as unsupported, so this
     /// stays off until every client in use can render them. With it off, tables
