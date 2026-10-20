@@ -11607,6 +11607,7 @@ mod tests {
                 "ok": false,
                 "description": "rich unsupported"
             })))
+            .expect(1)
             .mount(&mock_server)
             .await;
         Mock::given(method("POST"))
