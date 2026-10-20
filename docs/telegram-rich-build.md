@@ -4,10 +4,13 @@ This fork adds automatic rich-message routing to ZeroClaw PR #11862 at `24946811
 The PR is open and unmerged at the time of this build.
 This is an experimental build, not an official ZeroClaw release.
 
-The application source is pinned to `9b22b54852eb8dc49ed9a439586ce929c218d808`.
+The application source is pinned to `07bb9f629c5824e188a4188b981f523befc23bb4`.
 Plain text, inline formatting, and code use ordinary Telegram messages.
 Headings, lists, quotes, and tables use native rich messages when `rich_messages` is enabled.
 The channel selects the message type for each chunk and final draft edit.
+Incoming rich messages and reply quotes retain visible text, links, captions, and formula sources.
+Selected quotes and rich user mentions follow the existing reply and authorization rules.
+Rich media remains descriptive text in this conversion.
 The build also changes the release workflow, installer, tests, and documentation.
 The build branch replaces inherited workflows with one manual release workflow.
 The fork's `master` branch remains unchanged.
@@ -38,7 +41,7 @@ Do not replace assets from a published release.
 
 ## Release files
 
-The release tag is `v0.8.6-telegram-rich-auto-9b22b5485`.
+The release tag is `v0.8.6-telegram-rich-auto-07bb9f629`.
 It points to the build commit, which includes the pinned application source and these build files.
 
 The release contains these files:
@@ -59,7 +62,7 @@ Do not run it through the ZeroClaw agent, because the update stops that agent's 
 Wait until the release workflow succeeds.
 
 ```sh
-(f=$(mktemp) && trap 'rm -f "$f"' 0 && curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/LionZXYAgent/zeroclaw/v0.8.6-telegram-rich-auto-9b22b5485/scripts/install-telegram-rich.sh -o "$f" && sh "$f")
+(f=$(mktemp) && trap 'rm -f "$f"' 0 && curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/LionZXYAgent/zeroclaw/v0.8.6-telegram-rich-auto-07bb9f629/scripts/install-telegram-rich.sh -o "$f" && sh "$f")
 ```
 
 The installer targets `/root/.cargo/bin/zeroclaw` and `/root/.zeroclaw`.

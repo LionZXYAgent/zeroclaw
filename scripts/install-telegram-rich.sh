@@ -6,8 +6,8 @@ umask 077
 
 main() {
     REPOSITORY=LionZXYAgent/zeroclaw
-    RELEASE_TAG=v0.8.6-telegram-rich-auto-9b22b5485
-    SOURCE_COMMIT=9b22b54852eb8dc49ed9a439586ce929c218d808
+    RELEASE_TAG=v0.8.6-telegram-rich-auto-07bb9f629
+    SOURCE_COMMIT=07bb9f629c5824e188a4188b981f523befc23bb4
     ASSET=zeroclaw-x86_64-unknown-linux-gnu.tar.gz
     BASE_URL="https://github.com/$REPOSITORY/releases/download/$RELEASE_TAG"
 
