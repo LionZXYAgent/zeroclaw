@@ -106,6 +106,13 @@ Tables wider than 20 columns stay fenced as code, which is the Bot API column
 limit. If `sendRichMessage` fails, the reply is sent as HTML. Draft updates
 while a reply is still being written stay plain text.
 
+Incoming rich messages become readable text before the agent receives them.
+Reply context uses the same conversion instead of the generic `[Message]` placeholder.
+If Telegram includes a selected quote, the agent receives that selection.
+Rich user mentions follow the same mention gate and sender authorization as ordinary messages.
+Rich media contributes its type, caption, and credit as text.
+This conversion does not download rich media or open links.
+
 ## 3. Choose how the first users are authorized
 
 Choose one of the following paths before starting the bot.

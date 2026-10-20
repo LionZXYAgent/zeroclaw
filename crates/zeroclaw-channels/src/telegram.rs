@@ -1125,9 +1125,7 @@ fn contains_native_rich_elements(markdown: &str) -> bool {
     Parser::new_ext(markdown, Options::ENABLE_TABLES).any(|event| {
         matches!(
             event,
-            Event::Start(
-                Tag::Heading { .. } | Tag::List(_) | Tag::BlockQuote(_) | Tag::Table(_)
-            )
+            Event::Start(Tag::Heading { .. } | Tag::List(_) | Tag::BlockQuote(_) | Tag::Table(_))
         )
     })
 }
@@ -1187,13 +1185,32 @@ fn project_block(block: &serde_json::Value) -> String {
             format!("```{lang}\n{text}\n```")
         }
         "divider" => "---".to_string(),
-        "block_quotation" | "expandable_block_quotation" | "pull_quotation" => {
-            project_nested_content(block)
-                .lines()
-                .map(|line| format!("> {line}"))
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
+        "mathematical_expression" => block
+            .get("expression")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        "buttons" => block
+            .get("buttons")
+            .and_then(serde_json::Value::as_array)
+            .map(|buttons| {
+                buttons
+                    .iter()
+                    .map(project_rich_button)
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            })
+            .unwrap_or_default(),
+        "blockquote"
+        | "expandable_blockquote"
+        | "pullquote"
+        | "block_quotation"
+        | "expandable_block_quotation"
+        | "pull_quotation" => project_nested_content(block)
+            .lines()
+            .map(|line| format!("> {line}"))
+            .collect::<Vec<_>>()
+            .join("\n"),
         _ => project_nested_content(block),
     }
 }
@@ -1218,7 +1235,62 @@ fn project_nested_content(block: &serde_json::Value) -> String {
             parts.push(nested);
         }
     }
+    // Rich media stays descriptive text here. Never fetch a URL or file while
+    // projecting an update or quote into the agent's context.
+    if let Some(kind) = block.get("type").and_then(serde_json::Value::as_str) {
+        let label = match kind {
+            "photo" => Some("[Photo]"),
+            "video" => Some("[Video]"),
+            "animation" => Some("[Animation]"),
+            "audio" => Some("[Audio]"),
+            "voice_note" => Some("[Voice message]"),
+            "document" => Some("[Document]"),
+            "map" => Some("[Map]"),
+            _ => None,
+        };
+        if let Some(label) = label {
+            parts.push(label.to_string());
+        }
+    }
+    if let Some(caption) = block.get("caption") {
+        let rendered = project_rich_text(caption);
+        if !rendered.is_empty() {
+            parts.push(rendered);
+        }
+        if let Some(credit) = caption.get("credit") {
+            let rendered = project_rich_text(credit);
+            if !rendered.is_empty() {
+                parts.push(rendered);
+            }
+        }
+    }
+    if let Some(credit) = block.get("credit") {
+        let rendered = project_rich_text(credit);
+        if !rendered.is_empty() {
+            parts.push(rendered);
+        }
+    }
     parts.join("\n")
+}
+
+fn project_rich_link(text: String, target: Option<&str>) -> String {
+    let Some(target) = target.filter(|target| !target.is_empty()) else {
+        return text;
+    };
+    if text.is_empty() || text == target {
+        target.to_string()
+    } else {
+        format!("{text} ({target})")
+    }
+}
+
+fn project_rich_button(button: &serde_json::Value) -> String {
+    let text = button
+        .get("text")
+        .map(project_rich_text)
+        .unwrap_or_default();
+    // Callback data and authentication metadata are not visible message text.
+    project_rich_link(text, button.get("url").and_then(serde_json::Value::as_str))
 }
 
 fn project_rich_text(value: &serde_json::Value) -> String {
@@ -1226,13 +1298,35 @@ fn project_rich_text(value: &serde_json::Value) -> String {
         serde_json::Value::String(text) => text.clone(),
         serde_json::Value::Array(items) => items.iter().map(project_rich_text).collect(),
         serde_json::Value::Object(map) => {
-            if let Some(text) = map.get("text") {
-                let rendered = project_rich_text(text);
-                if !rendered.is_empty() {
-                    return rendered;
+            let text = map.get("text").map(project_rich_text).unwrap_or_default();
+            match map.get("type").and_then(serde_json::Value::as_str) {
+                Some("url") => {
+                    return project_rich_link(
+                        text,
+                        map.get("url").and_then(serde_json::Value::as_str),
+                    );
                 }
+                Some("button") => {
+                    return map
+                        .get("button")
+                        .map(project_rich_button)
+                        .unwrap_or_default();
+                }
+                Some("mention") => {
+                    if let Some(username) = map.get("username").and_then(serde_json::Value::as_str)
+                    {
+                        return project_rich_link(
+                            text,
+                            Some(&format!("@{}", username.trim_start_matches('@'))),
+                        );
+                    }
+                }
+                _ => {}
             }
-            for key in ["source", "expression", "latex", "value"] {
+            if !text.is_empty() {
+                return text;
+            }
+            for key in ["alternative_text", "expression", "source", "latex", "value"] {
                 if let Some(text) = map.get(key).and_then(serde_json::Value::as_str)
                     && !text.is_empty()
                 {
@@ -1242,6 +1336,34 @@ fn project_rich_text(value: &serde_json::Value) -> String {
             String::new()
         }
         _ => String::new(),
+    }
+}
+
+/// Match a semantic user mention only in this message's rich content, never
+/// in its reply, forwarding attribution, or embedded user metadata.
+fn rich_message_mentions_user(value: &serde_json::Value, user_id: i64) -> bool {
+    match value {
+        serde_json::Value::Array(values) => values
+            .iter()
+            .any(|value| rich_message_mentions_user(value, user_id)),
+        serde_json::Value::Object(map) => {
+            if map.get("type").and_then(serde_json::Value::as_str) == Some("text_mention")
+                && map
+                    .get("user")
+                    .and_then(|user| user.get("id"))
+                    .and_then(serde_json::Value::as_i64)
+                    == Some(user_id)
+            {
+                return true;
+            }
+            [
+                "blocks", "items", "cells", "text", "summary", "caption", "credit",
+            ]
+            .iter()
+            .filter_map(|key| map.get(*key))
+            .any(|value| rich_message_mentions_user(value, user_id))
+        }
+        _ => false,
     }
 }
 
@@ -6557,8 +6679,15 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             })
             .unwrap_or("unknown");
 
-        let reply_text = if let Some(text) = reply.get("text").and_then(serde_json::Value::as_str) {
+        let selected_quote = message
+            .get("quote")
+            .and_then(|quote| quote.get("text"))
+            .and_then(serde_json::Value::as_str)
+            .filter(|text| !text.trim().is_empty());
+        let reply_text = if let Some(text) = selected_quote {
             text.to_string()
+        } else if let Some(text) = incoming_message_text(reply) {
+            text
         } else if reply.get("voice").is_some() || reply.get("audio").is_some() {
             let reply_mid = reply.get("message_id").and_then(serde_json::Value::as_i64);
             let chat_id = message
@@ -6639,7 +6768,12 @@ Allowlist Telegram username (without '@') or numeric user ID.",
             // of intent, so it counts as addressed alongside an @-mention.
             let addressed = Self::contains_bot_mention(text, bot_username) || {
                 let bot_id = *self.bot_id.lock();
-                bot_id.is_some_and(|id| Self::is_reply_to_bot(message, id))
+                bot_id.is_some_and(|id| {
+                    Self::is_reply_to_bot(message, id)
+                        || message
+                            .get("rich_message")
+                            .is_some_and(|rich| rich_message_mentions_user(rich, id))
+                })
             };
             if !addressed {
                 if Self::should_record_passive_group_context(
@@ -13800,7 +13934,10 @@ mod tests {
             "> - A nested list",
             "| Name | Value |\n| --- | --- |\n| A | B |",
         ] {
-            assert!(contains_native_rich_elements(&prepare_rich_markdown(markdown)), "{markdown:?}");
+            assert!(
+                contains_native_rich_elements(&prepare_rich_markdown(markdown)),
+                "{markdown:?}"
+            );
         }
     }
 
@@ -13822,12 +13959,20 @@ mod tests {
             "    # An indented code block\n    - Not a list",
             "![Image](https://example.com/image.png) and $x^2$",
         ] {
-            assert!(!contains_native_rich_elements(&prepare_rich_markdown(markdown)), "{markdown:?}");
+            assert!(
+                !contains_native_rich_elements(&prepare_rich_markdown(markdown)),
+                "{markdown:?}"
+            );
         }
-        let header = (0..21).map(|i| format!("c{i}")).collect::<Vec<_>>().join(" | ");
+        let header = (0..21)
+            .map(|i| format!("c{i}"))
+            .collect::<Vec<_>>()
+            .join(" | ");
         let separator = vec!["---"; 21].join(" | ");
         let wide_table = format!("| {header} |\n| {separator} |\n");
-        assert!(!contains_native_rich_elements(&prepare_rich_markdown(&wide_table)));
+        assert!(!contains_native_rich_elements(&prepare_rich_markdown(
+            &wide_table
+        )));
     }
 
     #[test]
@@ -13866,7 +14011,15 @@ mod tests {
         )
         .with_rich_messages(true)
         .with_api_base(server.uri());
-        channel.send_text_chunks("Fixed. **Bold** and `code` stay ordinary.", "100", Some("64"), 0).await.unwrap();
+        channel
+            .send_text_chunks(
+                "Fixed. **Bold** and `code` stay ordinary.",
+                "100",
+                Some("64"),
+                0,
+            )
+            .await
+            .unwrap();
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         assert!(requests[0].url.path().ends_with("/sendMessage"));
@@ -13900,8 +14053,16 @@ mod tests {
         )
         .with_rich_messages(true)
         .with_api_base(server.uri());
-        for text in ["# Heading", "- Item", "> Quote", "| A | B |\n| --- | --- |\n| 1 | 2 |"] {
-            channel.send_text_chunks(text, "100", Some("64"), 0).await.unwrap();
+        for text in [
+            "# Heading",
+            "- Item",
+            "> Quote",
+            "| A | B |\n| --- | --- |\n| 1 | 2 |",
+        ] {
+            channel
+                .send_text_chunks(text, "100", Some("64"), 0)
+                .await
+                .unwrap();
         }
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 4);
@@ -13909,7 +14070,9 @@ mod tests {
             assert!(request.url.path().ends_with("/sendRichMessage"));
             let body: serde_json::Value = request.body_json().unwrap();
             assert_eq!(body["message_thread_id"], "64");
-            assert!(contains_native_rich_elements(body["rich_message"]["markdown"].as_str().unwrap()));
+            assert!(contains_native_rich_elements(
+                body["rich_message"]["markdown"].as_str().unwrap()
+            ));
         }
     }
 
@@ -13937,10 +14100,22 @@ mod tests {
         let message = "я".repeat(5_000);
         let count = split_message_for_telegram_keeping_tables(&message).len();
         assert!(count > 1);
-        assert_eq!(channel.send_text_chunks(&message, "100", None, 0).await.unwrap(), count);
+        assert_eq!(
+            channel
+                .send_text_chunks(&message, "100", None, 0)
+                .await
+                .unwrap(),
+            count
+        );
         let sent = server.received_requests().await.unwrap().len();
         assert_eq!(sent, count);
-        assert_eq!(channel.send_text_chunks_resuming(&message, "100", None, 1, 0).await.unwrap(), count);
+        assert_eq!(
+            channel
+                .send_text_chunks_resuming(&message, "100", None, 1, 0)
+                .await
+                .unwrap(),
+            count
+        );
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len() - sent, count - 1);
         for request in requests {
@@ -13971,17 +14146,35 @@ mod tests {
         )
         .with_rich_messages(true)
         .with_api_base(server.uri());
-        let message = format!("{}\n\n# Status\nReady.", "x".repeat(TELEGRAM_RICH_MAX_MESSAGE_LENGTH));
-        channel.send_text_chunks(&message, "100", None, 0).await.unwrap();
+        let message = format!(
+            "{}\n\n# Status\nReady.",
+            "x".repeat(TELEGRAM_RICH_MAX_MESSAGE_LENGTH)
+        );
+        channel
+            .send_text_chunks(&message, "100", None, 0)
+            .await
+            .unwrap();
         let requests = server.received_requests().await.unwrap();
-        assert!(requests.iter().any(|request| request.url.path().ends_with("/sendMessage")));
-        assert!(requests.iter().any(|request| request.url.path().ends_with("/sendRichMessage")));
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.url.path().ends_with("/sendMessage"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| request.url.path().ends_with("/sendRichMessage"))
+        );
         for request in requests {
             let body: serde_json::Value = request.body_json().unwrap();
             if request.url.path().ends_with("/sendRichMessage") {
-                assert!(contains_native_rich_elements(body["rich_message"]["markdown"].as_str().unwrap()));
+                assert!(contains_native_rich_elements(
+                    body["rich_message"]["markdown"].as_str().unwrap()
+                ));
             } else {
-                assert!(body["text"].as_str().unwrap().chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH);
+                assert!(
+                    body["text"].as_str().unwrap().chars().count() <= TELEGRAM_MAX_MESSAGE_LENGTH
+                );
             }
         }
     }
@@ -14008,8 +14201,14 @@ mod tests {
         )
         .with_rich_messages(true)
         .with_api_base(server.uri());
-        channel.finalize_draft("100:64", "42", "Plain text with **bold**.", true).await.unwrap();
-        channel.finalize_draft("100:64", "42", "# Status\nReady.", true).await.unwrap();
+        channel
+            .finalize_draft("100:64", "42", "Plain text with **bold**.", true)
+            .await
+            .unwrap();
+        channel
+            .finalize_draft("100:64", "42", "# Status\nReady.", true)
+            .await
+            .unwrap();
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 2);
         let plain: serde_json::Value = requests[0].body_json().unwrap();
@@ -14129,6 +14328,238 @@ mod tests {
         assert!(prepared.contains("echo \"$HOME$\""));
         assert!(prepared.contains("x^2"));
         assert!(!prepared.contains("$x^2$"));
+    }
+
+    fn incoming_rich_test_channel(mention_only: bool) -> TelegramChannel {
+        let channel = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["*".into()]),
+            mention_only,
+        );
+        *channel.bot_username.lock() = Some("testbot".to_string());
+        *channel.bot_id.lock() = Some(123);
+        channel
+    }
+
+    fn incoming_rich_test_update(rich: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "update_id": 20,
+            "message": {
+                "message_id": 200,
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": -100, "type": "supergroup" },
+                "is_topic_message": true,
+                "message_thread_id": 64,
+                "rich_message": rich
+            }
+        })
+    }
+
+    #[test]
+    fn incoming_rich_reply_context_contains_the_actual_message() {
+        let channel = incoming_rich_test_channel(false);
+        let update = serde_json::json!({
+            "message": {
+                "message_id": 201,
+                "from": { "id": 7, "username": "alice" },
+                "chat": { "id": -100, "type": "supergroup" },
+                "is_topic_message": true,
+                "message_thread_id": 64,
+                "text": "Also fix receiving rich messages",
+                "reply_to_message": {
+                    "message_id": 200,
+                    "from": { "id": 123, "username": "testbot" },
+                    "rich_message": { "blocks": [
+                        { "type": "heading", "size": 2, "text": "Status" },
+                        { "type": "paragraph", "text": ["The ", { "type": "bold", "text": "build" }, " passed."] },
+                        { "type": "table", "cells": [[{"text":"Test"},{"text":"Result"}],[{"text":"Routing"},{"text":"Passed"}]] }
+                    ] }
+                }
+            }
+        });
+        let parsed = channel.parse_update_message(&update).unwrap();
+        assert!(parsed.content.starts_with("> @testbot:\n> ## Status\n"));
+        assert!(parsed.content.contains("> The build passed."));
+        assert!(parsed.content.contains("> | Routing | Passed |"));
+        assert!(parsed.content.ends_with("Also fix receiving rich messages"));
+        assert!(!parsed.content.contains("[Message]"));
+        assert_eq!(parsed.sender, "alice");
+        assert_eq!(parsed.reply_target, "-100:64");
+        assert_eq!(parsed.thread_ts.as_deref(), Some("64"));
+    }
+
+    #[test]
+    fn incoming_rich_reply_context_uses_the_selected_quote() {
+        let channel = incoming_rich_test_channel(false);
+        let message = serde_json::json!({
+            "quote": { "text": "Only the selected section", "position": 4, "is_manual": true },
+            "reply_to_message": {
+                "from": { "username": "testbot" },
+                "rich_message": { "blocks": [{ "type": "paragraph", "text": "Whole message, including other sections" }] }
+            }
+        });
+        assert_eq!(
+            channel.extract_reply_context(&message).unwrap(),
+            "> @testbot:\n> Only the selected section"
+        );
+        let mut empty_quote = message;
+        empty_quote["quote"]["text"] = serde_json::json!("  ");
+        let context = channel.extract_reply_context(&empty_quote).unwrap();
+        assert!(context.contains("Whole message, including other sections"));
+        assert!(!context.contains("[Message]"));
+    }
+
+    #[test]
+    fn incoming_rich_projection_preserves_visible_content_and_links() {
+        let rich = serde_json::json!({ "blocks": [
+            { "type": "paragraph", "text": [
+                "Read ", { "type": "url", "text": { "type": "bold", "text": "the guide" }, "url": "https://example.com/guide" },
+                " ", { "type": "custom_emoji", "custom_emoji_id": "ignored-emoji-id", "alternative_text": "🦊" },
+                " ", { "type": "mathematical_expression", "expression": "x^2" }
+            ] },
+            { "type": "mathematical_expression", "expression": "E=mc^2" },
+            { "type": "details", "summary": "More details", "blocks": [{ "type": "paragraph", "text": "Nested content" }] },
+            { "type": "blockquote", "blocks": [{ "type": "paragraph", "text": "Quoted text" }], "credit": "Alice" },
+            { "type": "expandable_blockquote", "text": "Expandable quote", "credit": "Bob" },
+            { "type": "pullquote", "text": "Pull quote", "credit": "Charlie" },
+            { "type": "photo", "photo": [{ "file_id": "ignored-photo-id" }], "caption": { "text": "A diagram", "credit": "Dana" } },
+            { "type": "document", "document": { "file_id": "ignored-file-id" }, "caption": { "text": "A report" } },
+            { "type": "paragraph", "text": { "type": "button", "button": { "text": "Visit", "url": "https://example.com" } } },
+            { "type": "buttons", "buttons": [
+                { "text": "Open", "url": "https://example.com/open" },
+                { "text": "Confirm", "callback_data": "never include callback metadata" }
+            ] }
+        ] });
+        let projected = project_rich_message(&rich).unwrap();
+        for expected in [
+            "the guide (https://example.com/guide)",
+            "🦊",
+            "x^2",
+            "E=mc^2",
+            "More details",
+            "Nested content",
+            "> Quoted text",
+            "> Alice",
+            "> Expandable quote",
+            "> Bob",
+            "> Pull quote",
+            "> Charlie",
+            "[Photo]\nA diagram\nDana",
+            "[Document]\nA report",
+            "Visit (https://example.com)",
+            "Open (https://example.com/open) | Confirm",
+        ] {
+            assert!(
+                projected.contains(expected),
+                "missing {expected:?} in {projected:?}"
+            );
+        }
+        for hidden in [
+            "ignored-emoji-id",
+            "ignored-photo-id",
+            "ignored-file-id",
+            "never include callback metadata",
+        ] {
+            assert!(!projected.contains(hidden));
+        }
+    }
+
+    #[test]
+    fn incoming_rich_messages_preserve_body_sender_and_topic() {
+        let channel = incoming_rich_test_channel(false);
+        let update = incoming_rich_test_update(serde_json::json!({ "blocks": [
+            { "type": "heading", "size": 2, "text": "Привет" },
+            { "type": "paragraph", "text": ["A ", { "type": "italic", "text": "formatted" }, " body."] }
+        ] }));
+        let parsed = channel.parse_update_message(&update).unwrap();
+        assert_eq!(parsed.content, "## Привет\n\nA formatted body.");
+        assert_eq!(parsed.sender, "alice");
+        assert_eq!(parsed.platform_sender_id.as_deref(), Some("7"));
+        assert_eq!(parsed.reply_target, "-100:64");
+        assert_eq!(parsed.thread_ts.as_deref(), Some("64"));
+    }
+
+    #[test]
+    fn incoming_rich_user_mentions_pass_the_normal_mention_gate() {
+        let channel = incoming_rich_test_channel(true);
+        let mut update = incoming_rich_test_update(serde_json::json!({ "blocks": [{
+            "type": "paragraph", "text": ["Hello ", { "type": "text_mention", "text": "Kevin", "user": { "id": 123, "is_bot": true, "first_name": "Kevin" } }]
+        }] }));
+        let parsed = channel.parse_update_message(&update).unwrap();
+        assert_eq!(parsed.content, "Hello Kevin");
+        update["message"]["rich_message"]["blocks"][0]["text"][1]["user"]["id"] =
+            serde_json::json!(999);
+        assert!(channel.parse_update_message(&update).is_none());
+        update["message"]["rich_message"]["blocks"][0]["text"][1] = serde_json::json!({
+            "type": "mention", "text": "Kevin", "username": "testbot"
+        });
+        let parsed = channel.parse_update_message(&update).unwrap();
+        assert!(parsed.content.contains("@testbot"));
+    }
+
+    #[test]
+    fn incoming_rich_mentions_inside_reply_metadata_do_not_address_the_bot() {
+        let channel = incoming_rich_test_channel(true);
+        let mut update = incoming_rich_test_update(
+            serde_json::json!({ "blocks": [{ "type": "paragraph", "text": "A general comment" }] }),
+        );
+        update["message"]["reply_to_message"] = serde_json::json!({
+            "message_id": 180,
+            "from": { "id": 888, "username": "bob" },
+            "rich_message": { "blocks": [{ "type": "paragraph", "text": { "type": "text_mention", "text": "@testbot", "user": { "id": 123 } } }] }
+        });
+        assert!(channel.parse_update_message(&update).is_none());
+        update["message"]["reply_to_message"]["from"]["id"] = serde_json::json!(123);
+        assert!(channel.parse_update_message(&update).is_some());
+    }
+
+    #[test]
+    fn incoming_rich_messages_keep_sender_authorization() {
+        let channel = TelegramChannel::new(
+            "token".into(),
+            "telegram_test_alias",
+            Arc::new(|| vec!["alice".into()]),
+            false,
+        );
+        let mut update = incoming_rich_test_update(
+            serde_json::json!({ "blocks": [{ "type": "paragraph", "text": "Hello" }] }),
+        );
+        assert!(channel.parse_update_message(&update).is_some());
+        update["message"]["from"] = serde_json::json!({ "id": 8, "username": "eve" });
+        update["message"]["reply_to_message"] = serde_json::json!({
+            "from": { "id": 7, "username": "alice" },
+            "rich_message": { "blocks": [{ "type": "paragraph", "text": "Trusted sender in quote" }] }
+        });
+        assert!(channel.parse_update_message(&update).is_none());
+    }
+
+    #[test]
+    fn incoming_rich_empty_and_malformed_payloads_keep_safe_fallbacks() {
+        let channel = incoming_rich_test_channel(false);
+        for rich in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!({ "blocks": [] }),
+            serde_json::json!({ "blocks": "invalid" }),
+            serde_json::json!({ "blocks": [null, 5, { "type": "unknown" }] }),
+        ] {
+            assert!(
+                channel
+                    .parse_update_message(&incoming_rich_test_update(rich.clone()))
+                    .is_none()
+            );
+            let message = serde_json::json!({ "reply_to_message": { "from": { "username": "testbot" }, "rich_message": rich } });
+            assert_eq!(
+                channel.extract_reply_context(&message).unwrap(),
+                "> @testbot:\n> [Message]"
+            );
+        }
+        let message = serde_json::json!({ "reply_to_message": { "from": { "username": "testbot" }, "text": "Legacy text", "rich_message": { "blocks": [{ "type": "paragraph", "text": "Duplicate body" }] } } });
+        assert_eq!(
+            channel.extract_reply_context(&message).unwrap(),
+            "> @testbot:\n> Legacy text"
+        );
     }
 
     #[test]
