@@ -1,18 +1,21 @@
 # Pinned Telegram rich messages build
 
-This fork builds ZeroClaw PR #11862 at `24946811cc47ad925be4e9563c1a14d107217b0c`.
+This fork adds automatic rich-message routing to ZeroClaw PR #11862 at `24946811cc47ad925be4e9563c1a14d107217b0c`.
 The PR is open and unmerged at the time of this build.
 This is an experimental build, not an official ZeroClaw release.
 
-The application source matches the pinned PR.
-Only the release workflow, installer, installer tests, and this document differ.
+The application source is pinned to `9b22b54852eb8dc49ed9a439586ce929c218d808`.
+Plain text, inline formatting, and code use ordinary Telegram messages.
+Headings, lists, quotes, and tables use native rich messages when `rich_messages` is enabled.
+The channel selects the message type for each chunk and final draft edit.
+The build also changes the release workflow, installer, tests, and documentation.
 The build branch replaces inherited workflows with one manual release workflow.
 The fork's `master` branch remains unchanged.
 
 ## Build
 
 Open **Actions > Build Telegram rich messages release**.
-Select the `telegram-rich-pr11862` branch.
+Select the `telegram-rich-auto` branch.
 Run the workflow.
 
 GitHub Actions builds the binary on Ubuntu 22.04 for `x86_64-unknown-linux-gnu`.
@@ -22,6 +25,8 @@ It does not change the release optimization settings.
 The build needs no Rust installation on the deployment server.
 
 The workflow tests the installer with fake services and downloads.
+A separate job runs the routing tests and existing rich-message tests.
+Publication requires both the binary build and the tests to pass.
 It also checks the binary's configuration schema.
 These checks do not prove that live Telegram messages or MCP connections work.
 
@@ -33,7 +38,7 @@ Do not replace assets from a published release.
 
 ## Release files
 
-The release tag is `v0.8.6-telegram-rich-pr11862-24946811c`.
+The release tag is `v0.8.6-telegram-rich-auto-9b22b5485`.
 It points to the build commit, which includes the pinned application source and these build files.
 
 The release contains these files:
@@ -54,7 +59,7 @@ Do not run it through the ZeroClaw agent, because the update stops that agent's 
 Wait until the release workflow succeeds.
 
 ```sh
-(f=$(mktemp) && trap 'rm -f "$f"' 0 && curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/LionZXYAgent/zeroclaw/v0.8.6-telegram-rich-pr11862-24946811c/scripts/install-telegram-rich.sh -o "$f" && sh "$f")
+(f=$(mktemp) && trap 'rm -f "$f"' 0 && curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/LionZXYAgent/zeroclaw/v0.8.6-telegram-rich-auto-9b22b5485/scripts/install-telegram-rich.sh -o "$f" && sh "$f")
 ```
 
 The installer targets `/root/.cargo/bin/zeroclaw` and `/root/.zeroclaw`.

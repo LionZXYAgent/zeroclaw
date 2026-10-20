@@ -1,13 +1,13 @@
 #!/bin/sh
-# Install the pinned PR #11862 release on the existing systemd host.
+# Install the pinned automatic rich-message routing release on the existing systemd host.
 # Run this script over SSH. Do not run it through the ZeroClaw agent.
 set -eu
 umask 077
 
 main() {
     REPOSITORY=LionZXYAgent/zeroclaw
-    RELEASE_TAG=v0.8.6-telegram-rich-pr11862-24946811c
-    SOURCE_COMMIT=24946811cc47ad925be4e9563c1a14d107217b0c
+    RELEASE_TAG=v0.8.6-telegram-rich-auto-9b22b5485
+    SOURCE_COMMIT=9b22b54852eb8dc49ed9a439586ce929c218d808
     ASSET=zeroclaw-x86_64-unknown-linux-gnu.tar.gz
     BASE_URL="https://github.com/$REPOSITORY/releases/download/$RELEASE_TAG"
 

@@ -14,8 +14,8 @@ INSTALLER = Path(os.environ.get(
     "INSTALLER_UNDER_TEST",
     str(Path(__file__).resolve().parents[1] / "scripts/install-telegram-rich.sh"),
 ))
-SOURCE = "24946811cc47ad925be4e9563c1a14d107217b0c"
-TAG = "v0.8.6-telegram-rich-pr11862-24946811c"
+SOURCE = "9b22b54852eb8dc49ed9a439586ce929c218d808"
+TAG = "v0.8.6-telegram-rich-auto-9b22b5485"
 ASSET = "zeroclaw-x86_64-unknown-linux-gnu.tar.gz"
 
 NEW_BINARY = r'''#!/usr/bin/env python3
@@ -23,7 +23,7 @@ NEW_BINARY = r'''#!/usr/bin/env python3
 import json, os, pathlib, sys
 args = sys.argv[1:]
 if args == ["--version"]:
-    print("zeroclaw 0.8.6 (telegram-rich-pr11862-24946811c-test)")
+    print("zeroclaw 0.8.6 (telegram-rich-auto-9b22b5485-test)")
 elif args == ["config", "schema"]:
     print(json.dumps({"$defs": {
         "TelegramConfig": {"properties": {"rich_messages": {"type": "boolean", "default": False}}},
