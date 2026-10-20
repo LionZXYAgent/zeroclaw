@@ -1,0 +1,164 @@
+name: Build Telegram rich messages release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: telegram-rich-pr11862-release
+  cancel-in-progress: false
+
+env:
+  SOURCE_COMMIT: 24946811cc47ad925be4e9563c1a14d107217b0c
+  RELEASE_TAG: v0.8.6-telegram-rich-pr11862-24946811c
+  TARGET: x86_64-unknown-linux-gnu
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  build:
+    if: github.repository == 'LionZXYAgent/zeroclaw'
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the build revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+
+      - name: Make sure that the application matches the pinned PR
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=1 https://github.com/zeroclaw-labs/zeroclaw.git "$SOURCE_COMMIT"
+          git cat-file -e "${SOURCE_COMMIT}^{commit}"
+          git diff --exit-code "$SOURCE_COMMIT" HEAD -- . \
+            ':(exclude).github/workflows/**' \
+            ':(exclude)scripts/install-telegram-rich.sh' \
+            ':(exclude)tests/test_telegram_rich_installer.py' \
+            ':(exclude)docs/telegram-rich-build.md'
+
+      - name: Install build dependencies and the tested Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config cmake libssl-dev libdbus-1-dev
+          rustup toolchain install 1.98.0 --profile minimal --no-self-update
+          rustc +1.98.0 --version
+          cargo +1.98.0 --version
+
+      - name: Test the installer without changing a real service
+        run: |
+          sh -n scripts/install-telegram-rich.sh
+          python3 tests/test_telegram_rich_installer.py
+
+      - name: Build the Linux binary
+        shell: bash
+        env:
+          ZEROCLAW_BUILD_ID: telegram-rich-pr11862-24946811c-${{ github.sha }}
+        run: |
+          cargo +1.98.0 build --locked --release \
+            --target "$TARGET" -p zeroclaw --bin zeroclaw \
+            --features tools-compat
+
+      - name: Make sure that the binary exposes the required configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          binary="target/$TARGET/release/zeroclaw"
+          "$binary" --version
+          "$binary" config schema > "$RUNNER_TEMP/schema.json"
+          python3 - "$RUNNER_TEMP/schema.json" <<'PY'
+          import json, sys
+          schema = json.load(open(sys.argv[1]))["$defs"]
+          telegram = schema["TelegramConfig"]["properties"]
+          assert telegram["rich_messages"]["type"] == "boolean"
+          assert telegram["rich_messages"]["default"] is False
+          assert "tls_ca_cert_path" in schema["McpServerConfig"]["properties"]
+          print("Telegram rich messages and MCP custom CA support are present.")
+          PY
+
+      - name: Package the binary and its source information
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist package
+          install -m 755 "target/$TARGET/release/zeroclaw" package/zeroclaw
+          python3 - <<'PY'
+          import json, os
+          info = {
+              "repository": os.environ["GITHUB_REPOSITORY"],
+              "source_repository": "zeroclaw-labs/zeroclaw",
+              "source_commit": os.environ["SOURCE_COMMIT"],
+              "build_commit": os.environ["GITHUB_SHA"],
+              "release_tag": os.environ["RELEASE_TAG"],
+              "target": os.environ["TARGET"],
+              "rust_toolchain": "1.98.0",
+              "cargo_features": ["default", "tools-compat"],
+              "run_url": "https://github.com/{}/actions/runs/{}".format(
+                  os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_RUN_ID"]),
+          }
+          with open("package/BUILDINFO.json", "w") as f:
+              json.dump(info, f, indent=2)
+              f.write("\n")
+          PY
+          tar -C package -czf "dist/zeroclaw-$TARGET.tar.gz" zeroclaw BUILDINFO.json
+          (cd dist && sha256sum "zeroclaw-$TARGET.tar.gz" > SHA256SUMS)
+          cp package/BUILDINFO.json dist/BUILDINFO.json
+
+      - name: Save the release files for the publish job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: telegram-rich-linux-x86_64
+          path: dist/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
+  publish:
+    needs: build
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download the files from this build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: telegram-rich-linux-x86_64
+          path: dist
+
+      - name: Publish a versioned release without replacing an existing release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum --check SHA256SUMS)
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "The release already exists. Do not replace published binaries."
+            exit 1
+          fi
+          cat > release-notes.md <<EOF
+          Built from ZeroClaw PR #11862 at $SOURCE_COMMIT.
+          Build revision: $GITHUB_SHA.
+          Rust: 1.98.0. Target: $TARGET. Features: default, tools-compat.
+          The application source matches the pinned PR. Only build, installer, test, and documentation files differ.
+          The archive contains zeroclaw and BUILDINFO.json. SHA256SUMS covers the archive.
+          This is an experimental fork build, not an official ZeroClaw release.
+          The PR is unmerged. A compatible Bot API endpoint and Telegram client are required.
+          EOF
+          gh release create "$RELEASE_TAG" --target "$GITHUB_SHA" \
+            --title "ZeroClaw 0.8.6: Telegram rich messages, PR #11862" \
+            --notes-file release-notes.md --prerelease --draft
+          gh release upload "$RELEASE_TAG" \
+            "dist/zeroclaw-$TARGET.tar.gz" dist/SHA256SUMS dist/BUILDINFO.json
+          gh release edit "$RELEASE_TAG" --draft=false --latest=false
